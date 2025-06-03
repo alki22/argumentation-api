@@ -99,7 +99,7 @@ def annotate_stance(argument, topic):
     while retries < 20:
         try:
             full_prompt = stance_classification_prompt.format(argument=argument, topic=topic)
-            response = stance_classifier.models.generate_content(model=GEMINI_MODEL_ID,
+            response = llm_client.models.generate_content(model=GEMINI_MODEL_ID,
                                                       contents=full_prompt,
                                                       config={
                                                         'response_mime_type': 'application/json',
@@ -120,6 +120,9 @@ def annotate_stance(argument, topic):
 
     print(f"Max retries reached for text: {argument}")
     return None
+
+class TopicDetection(BaseModel):
+    topics: list[str] = Field(description="The topics that are present in the argument")
 
 class ArgumentTopicSimilarity:
     def __init__(self, model_name='all-MiniLM-L6-v2'):
@@ -471,9 +474,54 @@ class ArgumentTopicSimilarity:
             'sentence_mapping': mapping
         }
 
+        topic_detection_prompt = """
+        You are a topic detection system. Given an argument, determine the most relevant topics that the argument discusses.
+        Task: Analyze the provided argument and determine its relevant topics
+        Output Format: Return a list with the two most relevant topics topics
+        Instructions:
+        1. Read the argument carefully
+        2. Identify key phrases, sentiments, and positions expressed
+        3. Provide a list of topics
+        Your Task:
+        Argument: {argument}
+        """
+
+        class TopicDetection(BaseModel):
+            topics: list[str] = Field(description="The topics that are present in the argument")
+
+        def annotate_topics(argument):
+            """Send text to Gemini API for annotation"""
+            retries = 0
+            delay = 5
+
+            while retries < 20:
+                try:
+                    full_prompt = topic_detection_prompt.format(argument=argument)
+                    response = llm_client.models.generate_content(model=model_id,
+                                                            contents=full_prompt,
+                                                            config={
+                                                                'response_mime_type': 'application/json',
+                                                                'response_schema': TopicDetection,
+                                                                'temperature' : 0.2,
+                                                                }
+                                                            )
+                    time.sleep(5)
+                    return json.loads(response.candidates[0].content.parts[0].text.strip())
+                except exceptions.ResourceExhausted as e:
+                    print(f"Rate limit exceeded. Retrying in {delay} seconds...")
+                    time.sleep(delay + random.uniform(0, 1))  # Add some jitter
+                    delay *= 2  # Exponential backoff
+                    retries += 1
+                except Exception as e:
+                    print(f"Error processing text: {argument}\nError: {str(e)}")
+                    return None
+
+            print(f"Max retries reached for text: {argument}")
+            return None
+
 def load_models():
     """Load both S3BERT and topic similarity models"""
-    global model, topic_analyzer, stance_classifier
+    global model, topic_analyzer, llm_client
     
     # Load S3BERT model
     use_cuda = torch.cuda.is_available()
@@ -489,7 +537,7 @@ def load_models():
     print("Topic similarity analyzer loaded successfully")
     
     print("Loading stance classification model...")
-    stance_classifier = genai.Client(api_key=GEMINI_API_KEY)
+    llm_client = genai.Client(api_key=GEMINI_API_KEY)
     print("Stance classification model loaded successfully")
     
 
