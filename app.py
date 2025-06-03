@@ -1,5 +1,12 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS, cross_origin
+from google.api_core import exceptions
+from pydantic import BaseModel, Field
+from google import genai
+import json
+import time
+import enum
+import random
 import torch
 import os
 import numpy as np
@@ -34,6 +41,85 @@ features = ["global"] + [
     'SRL ', 'Smatch ', 'Unlabeled ', 'max_indegree_sim', 'max_outdegree_sim', 
     'max_degree_sim', 'root_sim', 'quant_sim', 'score_wlk', 'score_wwlk'
 ] + ["residual"]
+# Global variable for stance classification
+
+GEMINI_MODEL_ID = "gemini-2.0-flash"
+stance_classification_prompt = """
+You are a stance detection system. Given an argument and a topic, determine the stance (position) that the argument takes toward the topic.
+
+Task: Analyze the provided argument and determine its stance toward the given topic, then provide a clear justification for your classification.
+
+Output Format: Return one of the following three stance labels with justification:
+- FAVOR: The argument supports or is in favor of the topic
+- AGAINST: The argument opposes or is against the topic  
+- NEUTRAL: The argument neither clearly supports nor opposes the topic, or presents a balanced view
+
+Instructions:
+1. Read the argument carefully
+2. Identify key phrases, sentiments, and positions expressed
+3. Determine how these relate to the given topic
+4. Classify the overall stance
+5. Provide a brief justification explaining your reasoning
+
+Input Format:
+Topic: [TOPIC]
+Argument: [ARGUMENT]
+
+Output Format:
+Stance: [FAVOR/AGAINST/NEUTRAL]
+Justification: [Explain the key elements in the argument that led to this classification, citing specific phrases or reasoning patterns]
+
+Example:
+Topic: Electric vehicles
+Argument: "Electric cars are expensive and have limited range, making them impractical for most families."
+Stance: AGAINST
+Justification: The argument presents two negative characteristics of electric vehicles ("expensive" and "limited range") and concludes they are "impractical for most families," clearly opposing their adoption.
+
+Your Task:
+Topic: {topic}
+Argument: {argument}
+Stance:
+Justification:"""
+
+
+class Stance(enum.Enum):
+    FOR = "For"
+    AGAINST = "Against"
+    NEUTRAL = "Neutral"
+
+
+class StanceClassification(BaseModel):
+    stance: Stance = Field(description="The type of reasoning used in the argument")
+    justification: str = Field(description="The justification to support the provided stance")
+
+def annotate_stance(argument, topic):
+    retries = 0
+    delay = 5
+
+    while retries < 20:
+        try:
+            full_prompt = stance_classification_prompt.format(argument=argument, topic=topic)
+            response = stance_classifier.models.generate_content(model=GEMINI_MODEL_ID,
+                                                      contents=full_prompt,
+                                                      config={
+                                                        'response_mime_type': 'application/json',
+                                                        'response_schema': StanceClassification,
+                                                        'temperature' : 0.2,
+                                                        }
+                                                      )
+            #time.sleep(5)
+            return json.loads(response.candidates[0].content.parts[0].text.strip())
+        except exceptions.ResourceExhausted as e:
+            print(f"Rate limit exceeded. Retrying in {delay} seconds...")
+            time.sleep(delay + random.uniform(0, 1))  # Add some jitter
+            delay *= 2  # Exponential backoff
+            retries += 1
+        except Exception as e:
+            print(f"Error processing text: {argument}\nError: {str(e)}")
+            return None
+
+    print(f"Max retries reached for text: {argument}")
+    return None
 
 class ArgumentTopicSimilarity:
     def __init__(self, model_name='all-MiniLM-L6-v2'):
@@ -387,7 +473,7 @@ class ArgumentTopicSimilarity:
 
 def load_models():
     """Load both S3BERT and topic similarity models"""
-    global model, topic_analyzer
+    global model, topic_analyzer, stance_classifier
     
     # Load S3BERT model
     use_cuda = torch.cuda.is_available()
@@ -401,6 +487,11 @@ def load_models():
     print("Loading topic similarity analyzer...")
     topic_analyzer = ArgumentTopicSimilarity()
     print("Topic similarity analyzer loaded successfully")
+    
+    print("Loading stance classification model...")
+    stance_classifier = genai.Client(api_key=GEMINI_API_KEY)
+    print("Stance classification model loaded successfully")
+    
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -737,6 +828,47 @@ def batch_analyze_topic_similarity():
             "message": f"Error processing request: {str(e)}"
         }), 500
 
+@app.route('/stance-classification', methods=['POST'])
+def classify_stance():
+    """Given an argument and a topic, determine the stance (position) that the argument takes toward the topic."""
+    data = request.get_json()
+
+    if not data or 'argument1' not in data or 'argument2' not in data:
+        return jsonify({
+            "status": "error",
+            "message": "Please provide both 'sentence1' and 'sentence2' in the request body"
+        }), 400
+
+    argument = data['argument1']
+    topic = data['argument2']
+
+    if not isinstance(argument, str) or not isinstance(topic, str):
+        return jsonify({
+            "status": "error", 
+            "message": "The argument and topic must be strings"
+        }), 400
+
+    if not argument.strip() or not topic.strip():
+        return jsonify({
+            "status": "error",
+            "message": "The argument and topic cannot be empty"
+        }), 400
+
+    try:
+
+        result = annotate_stance(argument, topic)
+
+        return jsonify({
+            "status": "success",
+            "result": result
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error processing request: {str(e)}"
+        }), 500
+
 @app.route('/features', methods=['GET'])
 def get_features():
     """Get the list of semantic features analyzed by the S3BERT model"""
@@ -778,6 +910,9 @@ def get_endpoints():
             "topic_similarity": {
                 "/topic-similarity": "Analyze topic similarity between two arguments",
                 "/batch-topic-similarity": "Analyze topic similarity for multiple argument pairs"
+            },
+            "stance_classification": {
+                "/stance-classification": "Classify the stance of an argument"
             },
             "utility": {
                 "/health": "Health check endpoint",
