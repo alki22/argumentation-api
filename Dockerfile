@@ -1,5 +1,5 @@
 # Use the official NVIDIA CUDA image with Python as the base image
-FROM nvidia/cuda:12.3-base-ubuntu22.04
+FROM cuda:12.9.1-cudnn-devel-ubuntu22.04
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
