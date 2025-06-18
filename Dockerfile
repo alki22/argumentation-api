@@ -4,7 +4,8 @@ FROM nvidia/cuda:11.4.3-base-ubuntu20.04
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    GEMINI_API_KEY=AIzaSyCVE2jmdMR_7hI4niOesXK5iyO-tnEXThQ
 
 # Add labels for metadata
 LABEL maintainer="Your Name <your.email@example.com>"
@@ -43,9 +44,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Download the pre-trained S3BERT model
-RUN mkdir -p s3bert_all-MiniLM-L12-v2 && \
-    curl -L -o s3bert_model.tar.gz https://www.cl.uni-heidelberg.de/~opitz/data/s3bert_all-MiniLM-L12-v2.tar.gz && \
-    tar -xzf s3bert_model.tar.gz -C s3bert_all-MiniLM-L12-v2 && \
+RUN curl -L -o s3bert_model.tar.gz https://www.cl.uni-heidelberg.de/~opitz/data/s3bert_all-mpnet-base-v2.tar.gz && \
+    tar -xzf s3bert_model.tar.gz -C . && \
     rm s3bert_model.tar.gz
 
 # Copy the application code
