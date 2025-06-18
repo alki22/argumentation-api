@@ -20,10 +20,10 @@ RUN ln -sf /usr/share/zoneinfo/UTC /etc/localtime && \
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     build-essential \
-    python3.8 \
-    python3.8-dev \
-    python3.8-venv \
-    python3.8-distutils \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3.12-distutils \
     python3-pip \
     git \
     curl \
@@ -31,7 +31,7 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up Python alias
-RUN ln -sf /usr/bin/python3.8 /usr/bin/python && \
+RUN ln -sf /usr/bin/python3.12 /usr/bin/python && \
     ln -sf /usr/bin/pip3 /usr/bin/pip
 
 # Set working directory
