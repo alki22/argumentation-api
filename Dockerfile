@@ -1,5 +1,5 @@
 # Use the official NVIDIA CUDA image with Python as the base image
-FROM nvidia/cuda:11.4.3-base-ubuntu20.04
+FROM nvidia/cuda:12.3-base-ubuntu22.04
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -16,14 +16,19 @@ LABEL description="Flask API for S3BERT sentence similarity analysis"
 RUN ln -sf /usr/share/zoneinfo/UTC /etc/localtime && \
     echo UTC > /etc/timezone
 
-# Install system dependencies
+# Add deadsnakes PPA for Python 3.12
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+    apt-get install -y --no-install-recommends software-properties-common && \
+    add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update
+
+# Install system dependencies
+RUN apt-get install -y --no-install-recommends \
     build-essential \
-    python3.11 \
-    python3.11-dev \
-    python3.11-venv \
-    python3.11-distutils \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3.12-distutils \
     python3-pip \
     git \
     curl \
@@ -31,7 +36,7 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up Python alias
-RUN ln -sf /usr/bin/python3.11 /usr/bin/python && \
+RUN ln -sf /usr/bin/python3.12 /usr/bin/python && \
     ln -sf /usr/bin/pip3 /usr/bin/pip
 
 # Set working directory
