@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS, cross_origin
 from google.api_core import exceptions
 from pydantic import BaseModel, Field
@@ -24,7 +24,12 @@ import re
 warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
-cors = CORS(app)
+#cors = CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, 
+      origins="*",
+      methods=["GET", "POST", "OPTIONS"],
+      allow_headers=["Content-Type", "Authorization"]
+    )
 
 # Global variables for S3BERT
 model = None
@@ -38,12 +43,13 @@ topic_analyzer = None
 # List of features for similarity scores
 features = ["global"] + [
     'Concepts ', 'Frames ', 'Named Ent. ', 'Negations ', 'Reentrancies ',
-    'SRL ', 'Smatch ', 'Unlabeled ', 'max_indegree_sim', 'max_outdegree_sim', 
+    'SRL ', 'Smatch ', 'Unlabeled ', 'max_indegree_sim', 'max_outdegree_sim',
     'max_degree_sim', 'root_sim', 'quant_sim', 'score_wlk', 'score_wwlk'
 ] + ["residual"]
 # Global variable for stance classification
-
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 GEMINI_MODEL_ID = "gemini-2.0-flash"
+
 stance_classification_prompt = """
 You are a stance detection system. Given an argument and a topic, determine the stance (position) that the argument takes toward the topic.
 
@@ -81,16 +87,89 @@ Argument: {argument}
 Stance:
 Justification:"""
 
+premise_claim_detection_prompt = """
+You are an expert in argument mining and logic. Your task is to analyze an argument by extracting its premises and claim, while preserving the original wording as much as possible. 
+Task:
+Given a text containing an argument, you must:
+1. Identify and extract the premise(s) that logically support the claim.
+2. Identify and extract the claim that the argument is trying to establish.
+3. If a premise or claim is implicit or missing, return an empty value for that component.
+
+Additional Constraints:
+
+1. Keep the wording as close as possible to the original sentence.
+2. If either the premise or claim is implicit, return an empty value for that field.
+3. If there's not a clear premise-claim structure or either of them is not clear, just return the original sentence (without paraphrasing) as both premise and claim
+
+Input Format:
+Argument: [ARGUMENT]
+
+Output Format:
+Premise: [EXTRACTED PREMISE]
+Claim: [EXTRACTED CLAIM]
+
+Your Task:
+Argument: {argument}
+Premise:
+Claim:
+"""
+
+reasoning_type_prompt = """
+You are an expert in argument mining and logic. Your task is to analyze the type of reasoning used in the argument based on the following definitions:
+
+Deductive Reasoning:
+Deductive reasoning moves from general premises to a specific conclusion that logically follows. If the premises are true, the conclusion must also be true. It is characterized by necessity and validity.
+
+Inductive Reasoning:
+Inductive reasoning moves from specific observations to a general conclusion. The conclusion is probable but not guaranteed.
+
+Abductive Reasoning:
+Abductive reasoning infers the most likely explanation from incomplete evidence. It is commonly used in diagnostics and hypothesis formation.
+
+Analogical Reasoning:
+Analogical reasoning draws a conclusion based on the similarity between two situations. The strength of the argument depends on how relevant the analogy is.
+
+Instructions:
+1. Read the argument carefully
+2. Identify relations between claims and premises
+3. Determine how these relate to each other
+4. Classify the reasoning type
+5. Provide a brief justification explaining your reasoning
+
+Input Format:
+Argument: [ARGUMENT]
+
+Output Format:
+Stance: [DEDUCTIVE/INDUCTIVE/ABDUCTIVE/ANALOGICAL]
+Justification: [Explain the key elements in the argument that led to this classification, citing specific phrases or reasoning patterns]
+
+Your Task:
+Argument: {argument}
+Reasoning type:
+Justification:
+"""
+
+topic_detection_prompt = """
+    You are a topic detection system. Given an argument, determine the most relevant topics that the argument discusses.
+    Task: Analyze the provided argument and determine its relevant topics
+    Output Format: Return a list with the two most relevant topics topics
+    Instructions:
+    1. Read the argument carefully
+    2. Identify key phrases, sentiments, and positions expressed
+    3. Provide a list of two topics, ordered from most to least relevant
+    Your Task:
+    Argument: {argument}
+"""
 
 class Stance(enum.Enum):
     FOR = "For"
     AGAINST = "Against"
     NEUTRAL = "Neutral"
 
-
 class StanceClassification(BaseModel):
     stance: Stance = Field(description="The type of reasoning used in the argument")
     justification: str = Field(description="The justification to support the provided stance")
+
 
 def annotate_stance(argument, topic):
     retries = 0
@@ -121,8 +200,117 @@ def annotate_stance(argument, topic):
     print(f"Max retries reached for text: {argument}")
     return None
 
+class Reasoning(enum.Enum):
+    DEDUCTIVE = "Deductive"
+    INDUCTIVE = "Inductive"
+    ABDUCTIVE = "Abductive"
+    ANALOGICAL = "Analogical"
+
+
+class ReasoningTypeAnnotation(BaseModel):
+    reasoning_type: Reasoning = Field(description="The type of reasoning used in the argument")
+    justification: str = Field(description="Justification for the chosen reasoning type")
+
+def annotate_reasoning_type(argument):
+    """Send text to Gemini API for reasoning type annotation"""
+    retries = 0
+    delay = 5
+
+    while retries < 20:
+        try:
+            full_prompt = reasoning_type_prompt.format(argument=argument)
+            response = llm_client.models.generate_content(
+                model=GEMINI_MODEL_ID,
+                contents=full_prompt,
+                config={
+                    'response_mime_type': 'application/json',
+                    'response_schema': ReasoningTypeAnnotation,
+                    'temperature': 0.2,
+                }
+            )
+            time.sleep(1)  # Reduced sleep time
+            return json.loads(response.candidates[0].content.parts[0].text.strip())
+        except exceptions.ResourceExhausted as e:
+            print(f"Rate limit exceeded. Retrying in {delay} seconds...")
+            time.sleep(delay + random.uniform(0, 1))  # Add some jitter
+            delay *= 2  # Exponential backoff
+            retries += 1
+        except Exception as e:
+            print(f"Error processing text: {argument}\nError: {str(e)}")
+            return None
+
+    print(f"Max retries reached for text: {argument}")
+    return None
+
 class TopicDetection(BaseModel):
     topics: list[str] = Field(description="The topics that are present in the argument")
+
+def annotate_topics(argument):
+    """Send text to Gemini API for topic annotation"""
+    retries = 0
+    delay = 5
+
+    while retries < 20:
+        try:
+            full_prompt = topic_detection_prompt.format(argument=argument)
+            response = llm_client.models.generate_content(
+                model=GEMINI_MODEL_ID,
+                contents=full_prompt,
+                config={
+                    'response_mime_type': 'application/json',
+                    'response_schema': TopicDetection,
+                    'temperature': 0.2,
+                }
+            )
+            time.sleep(1)  # Reduced sleep time
+            return json.loads(response.candidates[0].content.parts[0].text.strip())
+        except exceptions.ResourceExhausted as e:
+            print(f"Rate limit exceeded. Retrying in {delay} seconds...")
+            time.sleep(delay + random.uniform(0, 1))  # Add some jitter
+            delay *= 2  # Exponential backoff
+            retries += 1
+        except Exception as e:
+            print(f"Error processing text: {argument}\nError: {str(e)}")
+            return None
+
+    print(f"Max retries reached for text: {argument}")
+    return None
+
+
+
+class PremiseClaimDetection(BaseModel):
+    premise: str = Field(description="The argument extracted premise")
+    claim: str = Field(description="The argument extracted claim")
+
+def annotate_premise_claim(argument):
+    """Send text to Gemini API for premise-claim extraction"""
+    retries = 0
+    delay = 5
+
+    while retries < 20:
+        try:
+            full_prompt = premise_claim_detection_prompt.format(argument=argument)
+            response = llm_client.models.generate_content(model=GEMINI_MODEL_ID,  # Fixed: was using 'client' instead of 'llm_client'
+                                                      contents=full_prompt,
+                                                      config={
+                                                        'response_mime_type': 'application/json',
+                                                        'response_schema': PremiseClaimDetection,
+                                                        'temperature' : 0.2,
+                                                        }
+                                                      )
+            time.sleep(1)  # Reduced sleep time to match other functions
+            return json.loads(response.candidates[0].content.parts[0].text.strip())
+        except exceptions.ResourceExhausted as e:
+            print(f"Rate limit exceeded. Retrying in {delay} seconds...")
+            time.sleep(delay + random.uniform(0, 1))  # Add some jitter
+            delay *= 2  # Exponential backoff
+            retries += 1
+        except Exception as e:
+            print(f"Error processing text: {argument}\nError: {str(e)}")
+            return None
+
+    print(f"Max retries reached for text: {argument}")
+    return None
 
 class ArgumentTopicSimilarity:
     def __init__(self, model_name='all-MiniLM-L6-v2'):
@@ -473,51 +661,94 @@ class ArgumentTopicSimilarity:
             'sentences': sentences,
             'sentence_mapping': mapping
         }
-
-        topic_detection_prompt = """
-        You are a topic detection system. Given an argument, determine the most relevant topics that the argument discusses.
-        Task: Analyze the provided argument and determine its relevant topics
-        Output Format: Return a list with the two most relevant topics topics
-        Instructions:
-        1. Read the argument carefully
-        2. Identify key phrases, sentiments, and positions expressed
-        3. Provide a list of topics
-        Your Task:
-        Argument: {argument}
+    
+    def calculate_llm_topic_similarity(self, arg1, arg2):
         """
-
-        class TopicDetection(BaseModel):
-            topics: list[str] = Field(description="The topics that are present in the argument")
-
-        def annotate_topics(argument):
-            """Send text to Gemini API for annotation"""
-            retries = 0
-            delay = 5
-
-            while retries < 20:
-                try:
-                    full_prompt = topic_detection_prompt.format(argument=argument)
-                    response = llm_client.models.generate_content(model=model_id,
-                                                            contents=full_prompt,
-                                                            config={
-                                                                'response_mime_type': 'application/json',
-                                                                'response_schema': TopicDetection,
-                                                                'temperature' : 0.2,
-                                                                }
-                                                            )
-                    time.sleep(5)
-                    return json.loads(response.candidates[0].content.parts[0].text.strip())
-                except exceptions.ResourceExhausted as e:
-                    print(f"Rate limit exceeded. Retrying in {delay} seconds...")
-                    time.sleep(delay + random.uniform(0, 1))  # Add some jitter
-                    delay *= 2  # Exponential backoff
-                    retries += 1
-                except Exception as e:
-                    print(f"Error processing text: {argument}\nError: {str(e)}")
-                    return None
-
-            print(f"Max retries reached for text: {argument}")
-            return None
+        Calculate topic similarity using LLM-generated topics and S3BERT embeddings
+        
+        Args:
+            arg1 (str): First argument text
+            arg2 (str): Second argument text
+        
+        Returns:
+            dict: Results containing top similarity score and most similar topic pairs
+        """
+        try:
+            # Step 1: Get topics for both arguments using LLM
+            topics_arg1_result = annotate_topics(arg1)
+            topics_arg2_result = annotate_topics(arg2)
+            
+            if not topics_arg1_result or not topics_arg2_result:
+                return {
+                    'error': 'Failed to extract topics from one or both arguments',
+                    'top_similarity': 0.0,
+                    'top_pairs': []
+                }
+            
+            topics_arg1 = topics_arg1_result.get('topics', [])
+            topics_arg2 = topics_arg2_result.get('topics', [])
+            
+            if not topics_arg1 or not topics_arg2:
+                return {
+                    'error': 'No topics found in one or both arguments',
+                    'top_similarity': 0.0,
+                    'top_pairs': []
+                }
+            
+            # Step 2: Calculate S3BERT embeddings for all topics
+            all_topics = topics_arg1 + topics_arg2
+            topic_embeddings = model.encode(all_topics)
+            
+            # Split embeddings back into separate lists
+            embeddings_arg1 = topic_embeddings[:len(topics_arg1)]
+            embeddings_arg2 = topic_embeddings[len(topics_arg1):]
+            
+            # Step 3: Calculate cosine similarity between all pairs
+            similarity_results = []
+            
+            for i, (topic1, emb1) in enumerate(zip(topics_arg1, embeddings_arg1)):
+                for j, (topic2, emb2) in enumerate(zip(topics_arg2, embeddings_arg2)):
+                    # Calculate cosine similarity
+                    similarity = cosine_similarity([emb1], [emb2])[0][0]
+                    
+                    similarity_results.append({
+                        'topic1': topic1,
+                        'topic2': topic2,
+                        'similarity': float(similarity),
+                        'topic1_index': i,
+                        'topic2_index': j
+                    })
+            
+            # Step 4: Sort by similarity and get top results
+            similarity_results.sort(key=lambda x: x['similarity'], reverse=True)
+            
+            # Get top similarity score
+            top_similarity = similarity_results[0]['similarity'] if similarity_results else 0.0
+            
+            # Get top 3 most similar pairs (topics only, not similarity values)
+            top_pairs = [
+                {
+                    'topic1': result['topic1'],
+                    'topic2': result['topic2'],
+                    'similarity': result['similarity']
+                }
+                for result in similarity_results[:3]
+            ]
+            
+            return {
+                'topics_arg1': topics_arg1,
+                'topics_arg2': topics_arg2,
+                'top_similarity': top_similarity,
+                'top_pairs': top_pairs,
+                'all_similarities': similarity_results
+            }
+            
+        except Exception as e:
+            return {
+                'error': f'Error calculating LLM topic similarity: {str(e)}',
+                'top_similarity': 0.0,
+                'top_pairs': []
+            }
 
 def load_models():
     """Load both S3BERT and topic similarity models"""
@@ -557,7 +788,7 @@ def health_check():
     })
 
 # Original S3BERT endpoints
-@app.route('/compare', methods=['POST'])
+@app.route('/compare', methods=['POST', 'OPTIONS'])
 def compare_sentences():
     """Compare two sentences and return similarity scores"""
     data = request.get_json()
@@ -614,7 +845,7 @@ def compare_sentences():
             "message": f"Error processing request: {str(e)}"
         }), 500
 
-@app.route('/batch-compare', methods=['POST'])
+@app.route('/batch-compare', methods=['POST', 'OPTIONS'])
 def batch_compare_sentences():
     """Compare multiple sentence pairs and return similarity scores"""
     data = request.get_json()
@@ -695,7 +926,7 @@ def batch_compare_sentences():
         }), 500
 
 # New topic similarity endpoints
-@app.route('/topic-similarity', methods=['POST'])
+@app.route('/topic-similarity', methods=['POST', 'OPTIONS'])
 def analyze_topic_similarity():
     """Analyze topic similarity between two arguments"""
     data = request.get_json()
@@ -783,7 +1014,7 @@ def analyze_topic_similarity():
             "message": f"Error processing request: {str(e)}"
         }), 500
 
-@app.route('/batch-topic-similarity', methods=['POST'])
+@app.route('/batch-topic-similarity', methods=['POST', 'OPTIONS'])
 def batch_analyze_topic_similarity():
     """Analyze topic similarity for multiple argument pairs"""
     data = request.get_json()
@@ -876,7 +1107,216 @@ def batch_analyze_topic_similarity():
             "message": f"Error processing request: {str(e)}"
         }), 500
 
-@app.route('/stance-classification', methods=['POST'])
+
+@app.route('/extract-topics', methods=['POST', 'OPTIONS'])
+def extract_topics():
+    """Extract topics from a single argument using LLM"""
+    data = request.get_json()
+    
+    if not data or 'argument' not in data:
+        return jsonify({
+            "status": "error",
+            "message": "Please provide 'argument' in the request body"
+        }), 400
+    
+    argument = data['argument']
+    
+    if not isinstance(argument, str):
+        return jsonify({
+            "status": "error", 
+            "message": "Argument must be a string"
+        }), 400
+    
+    if not argument.strip():
+        return jsonify({
+            "status": "error",
+            "message": "Argument cannot be empty"
+        }), 400
+    
+    try:
+        # Use the existing annotate_topics function
+        result = annotate_topics(argument)
+        
+        if not result:
+            return jsonify({
+                "status": "error",
+                "message": "Failed to extract topics from the argument"
+            }), 500
+        
+        topics = result.get('topics', [])
+        
+        if not topics:
+            return jsonify({
+                "status": "error",
+                "message": "No topics found in the argument"
+            }), 400
+        
+        response_data = {
+            "argument": argument,
+            "topics": topics,
+            "topic_count": len(topics)
+        }
+        
+        return jsonify({
+            "status": "success",
+            "result": response_data
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error processing request: {str(e)}"
+        }), 500
+
+@app.route('/batch-extract-topics', methods=['POST', 'OPTIONS'])
+def batch_extract_topics():
+    """Extract topics from multiple arguments using LLM"""
+    data = request.get_json()
+    
+    if not data or 'arguments' not in data:
+        return jsonify({
+            "status": "error",
+            "message": "Please provide 'arguments' list in the request body"
+        }), 400
+    
+    arguments = data['arguments']
+    
+    if not isinstance(arguments, list):
+        return jsonify({
+            "status": "error",
+            "message": "'arguments' must be a list of strings"
+        }), 400
+    
+    # Filter valid arguments
+    valid_arguments = []
+    for arg in arguments:
+        if isinstance(arg, str) and arg.strip():
+            valid_arguments.append(arg)
+    
+    if not valid_arguments:
+        return jsonify({
+            "status": "error",
+            "message": "No valid arguments provided"
+        }), 400
+    
+    try:
+        results = []
+        for argument in valid_arguments:
+            # Use the existing annotate_topics function
+            topic_result = annotate_topics(argument)
+            
+            if topic_result:
+                topics = topic_result.get('topics', [])
+                result = {
+                    "argument": argument,
+                    "topics": topics,
+                    "topic_count": len(topics),
+                    "status": "success"
+                }
+            else:
+                result = {
+                    "argument": argument,
+                    "topics": [],
+                    "topic_count": 0,
+                    "status": "error",
+                    "error": "Failed to extract topics"
+                }
+            
+            results.append(result)
+        
+        return jsonify({
+            "status": "success",
+            "results": results,
+            "total_processed": len(results)
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error processing request: {str(e)}"
+        }), 500
+
+@app.route('/topic-similarity-llm', methods=['POST', 'OPTIONS'])
+def analyze_llm_topic_similarity():
+    """Analyze topic similarity using LLM-generated topics and S3BERT embeddings"""
+    data = request.get_json()
+    
+    if not data or 'argument1' not in data or 'argument2' not in data:
+        return jsonify({
+            "status": "error",
+            "message": "Please provide both 'argument1' and 'argument2' in the request body"
+        }), 400
+    
+    argument1 = data['argument1']
+    argument2 = data['argument2']
+    
+    if not isinstance(argument1, str) or not isinstance(argument2, str):
+        return jsonify({
+            "status": "error", 
+            "message": "Both arguments must be strings"
+        }), 400
+    
+    if not argument1.strip() or not argument2.strip():
+        return jsonify({
+            "status": "error",
+            "message": "Arguments cannot be empty"
+        }), 400
+    
+    try:
+        results = topic_analyzer.calculate_llm_topic_similarity(argument1, argument2)
+        
+        if 'error' in results:
+            return jsonify({
+                "status": "error",
+                "message": results['error']
+            }), 400
+        
+        # Format response
+        top_similarity = results['top_similarity']
+        
+        # Similarity interpretation
+        if top_similarity > 0.8:
+            interpretation = "Very High Topic Similarity"
+        elif top_similarity > 0.6:
+            interpretation = "High Topic Similarity"
+        elif top_similarity > 0.4:
+            interpretation = "Moderate Topic Similarity"
+        elif top_similarity > 0.2:
+            interpretation = "Low Topic Similarity"
+        else:
+            interpretation = "Very Low Topic Similarity"
+        
+        response_data = {
+            "argument1": argument1,
+            "argument2": argument2,
+            "topics_argument1": results['topics_arg1'],
+            "topics_argument2": results['topics_arg2'],
+            "top_similarity_score": top_similarity,
+            "interpretation": interpretation,
+            "top_similar_pairs": [
+                {
+                    "topic_from_arg1": pair['topic1'],
+                    "topic_from_arg2": pair['topic2'],
+                    "similarity_score": pair['similarity']
+                }
+                for pair in results['top_pairs']
+            ],
+            "total_comparisons": len(results['all_similarities'])
+        }
+        
+        return jsonify({
+            "status": "success",
+            "result": response_data
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error processing request: {str(e)}"
+        }), 500
+
+
+@app.route('/stance-classification', methods=['POST', 'OPTIONS'])
 def classify_stance():
     """Given an argument and a topic, determine the stance (position) that the argument takes toward the topic."""
     data = request.get_json()
@@ -909,6 +1349,176 @@ def classify_stance():
         return jsonify({
             "status": "success",
             "result": result
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error processing request: {str(e)}"
+        }), 500
+
+@app.route('/reasoning-type-classification', methods=['POST', 'OPTIONS'])
+def classify_reasoning_type():
+    data = request.get_json()
+
+    if not data or 'argument1' not in data:
+        return jsonify({
+            "status": "error",
+            "message": "Please provide both 'sentence1' and 'sentence2' in the request body"
+        }), 400
+
+    argument = data['argument1']
+
+    if not isinstance(argument, str):
+        return jsonify({
+            "status": "error", 
+            "message": "The argument must be a string"
+        }), 400
+
+    if not argument.strip():
+        return jsonify({
+            "status": "error",
+            "message": "The argument cannot be empty"
+        }), 400
+
+    try:
+
+        result = annotate_reasoning_type(argument)
+
+        return jsonify({
+            "status": "success",
+            "result": result
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error processing request: {str(e)}"
+        }), 500
+
+@app.route('/extract-premise-claim', methods=['POST', 'OPTIONS'])
+def extract_premise_claim():
+    """Extract premise and claim from a single argument using LLM"""
+    data = request.get_json()
+    
+    if not data or 'argument' not in data:
+        return jsonify({
+            "status": "error",
+            "message": "Please provide 'argument' in the request body"
+        }), 400
+    
+    argument = data['argument']
+    
+    if not isinstance(argument, str):
+        return jsonify({
+            "status": "error", 
+            "message": "Argument must be a string"
+        }), 400
+    
+    if not argument.strip():
+        return jsonify({
+            "status": "error",
+            "message": "Argument cannot be empty"
+        }), 400
+    
+    try:
+        # Use the existing annotate_premise_claim function
+        result = annotate_premise_claim(argument)
+        
+        if not result:
+            return jsonify({
+                "status": "error",
+                "message": "Failed to extract premise and claim from the argument"
+            }), 500
+        
+        premise = result.get('premise', '')
+        claim = result.get('claim', '')
+        
+        response_data = {
+            "argument": argument,
+            "premise": premise,
+            "claim": claim,
+            "has_premise": bool(premise and premise.strip()),
+            "has_claim": bool(claim and claim.strip())
+        }
+        
+        return jsonify({
+            "status": "success",
+            "result": response_data
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error processing request: {str(e)}"
+        }), 500
+
+@app.route('/batch-extract-premise-claim', methods=['POST', 'OPTIONS'])
+def batch_extract_premise_claim():
+    """Extract premise and claim from multiple arguments using LLM"""
+    data = request.get_json()
+    
+    if not data or 'arguments' not in data:
+        return jsonify({
+            "status": "error",
+            "message": "Please provide 'arguments' list in the request body"
+        }), 400
+    
+    arguments = data['arguments']
+    
+    if not isinstance(arguments, list):
+        return jsonify({
+            "status": "error",
+            "message": "'arguments' must be a list of strings"
+        }), 400
+    
+    # Filter valid arguments
+    valid_arguments = []
+    for arg in arguments:
+        if isinstance(arg, str) and arg.strip():
+            valid_arguments.append(arg)
+    
+    if not valid_arguments:
+        return jsonify({
+            "status": "error",
+            "message": "No valid arguments provided"
+        }), 400
+    
+    try:
+        results = []
+        for argument in valid_arguments:
+            # Use the existing annotate_premise_claim function
+            premise_claim_result = annotate_premise_claim(argument)
+            
+            if premise_claim_result:
+                premise = premise_claim_result.get('premise', '')
+                claim = premise_claim_result.get('claim', '')
+                
+                result = {
+                    "argument": argument,
+                    "premise": premise,
+                    "claim": claim,
+                    "has_premise": bool(premise and premise.strip()),
+                    "has_claim": bool(claim and claim.strip()),
+                    "status": "success"
+                }
+            else:
+                result = {
+                    "argument": argument,
+                    "premise": "",
+                    "claim": "",
+                    "has_premise": False,
+                    "has_claim": False,
+                    "status": "error",
+                    "error": "Failed to extract premise and claim"
+                }
+            
+            results.append(result)
+        
+        return jsonify({
+            "status": "success",
+            "results": results,
+            "total_processed": len(results)
         })
         
     except Exception as e:
@@ -956,11 +1566,23 @@ def get_endpoints():
                 "/features": "Get list of semantic features analyzed by S3BERT"
             },
             "topic_similarity": {
-                "/topic-similarity": "Analyze topic similarity between two arguments",
-                "/batch-topic-similarity": "Analyze topic similarity for multiple argument pairs"
+                "/topic-similarity": "Analyze topic similarity between two arguments using BERTopic",
+                "/batch-topic-similarity": "Analyze topic similarity for multiple argument pairs using BERTopic",
+                "/topic-similarity-llm": "Analyze topic similarity using LLM-generated topics and S3BERT embeddings"
+            },
+            "topic_extraction": {
+                "/extract-topics": "Extract topics from a single argument using LLM",
+                "/batch-extract-topics": "Extract topics from multiple arguments using LLM"
+            },
+            "premise_claim_extraction": {
+                "/extract-premise-claim": "Extract premise and claim from a single argument using LLM",
+                "/batch-extract-premise-claim": "Extract premise and claim from multiple arguments using LLM"
             },
             "stance_classification": {
                 "/stance-classification": "Classify the stance of an argument"
+            },
+            "reasoning_classification": {
+                "/reasoning-type-classification": "Classify the reasoning type of an argument"
             },
             "utility": {
                 "/health": "Health check endpoint",
@@ -975,4 +1597,4 @@ if __name__ == '__main__':
     
     # Start the Flask app
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port, debug=True)#, ssl_context='adhoc')
