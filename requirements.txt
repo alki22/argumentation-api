@@ -4,7 +4,6 @@ cachetools==5.5.2
 certifi==2025.4.26
 charset-normalizer==3.4.2
 Cython==0.29.37
-filelock==3.18.0
 Flask==2.3.3
 Flask-Cors==3.0.10
 fsspec==2025.5.1
