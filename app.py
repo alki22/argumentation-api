@@ -33,7 +33,8 @@ CORS(app,
 
 # Global variables for S3BERT
 model = None
-model_name = "s3bert_all-mpnet-base-v2"
+#model_name = "s3bert_all-mpnet-base-v2"
+model_name = "s3bert_all-MiniLM-L12-v2"
 feature_dim = 16
 n_features = 15
 
