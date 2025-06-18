@@ -32,7 +32,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Download the pre-trained S3BERT model
-RUN curl -L -o s3bert_model.tar.gz https://www.cl.uni-heidelberg.de/~opitz/data/s3bert_all-mpnet-base-v2.tar.gz && \
+#RUN curl -L -o s3bert_model.tar.gz https://www.cl.uni-heidelberg.de/~opitz/data/s3bert_all-mpnet-base-v2.tar.gz && \
+#    tar -xzf s3bert_model.tar.gz -C . && \
+#    rm s3bert_model.tar.gz
+
+RUN curl -L -o s3bert_model.tar.gz https://www.cl.uni-heidelberg.de/~opitz/data/s3bert_all-MiniLM-L12-v2.tar.gz && \
     tar -xzf s3bert_model.tar.gz -C . && \
     rm s3bert_model.tar.gz
 
