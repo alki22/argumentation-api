@@ -27,8 +27,8 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install Python dependencies
-RUN python -m ensurepip --upgrade
-RUN python -m pip install --upgrade setuptools
+#RUN python -m ensurepip --upgrade
+#RUN python -m pip install --upgrade setuptools
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Download the pre-trained S3BERT model
@@ -40,7 +40,7 @@ RUN curl -L -o s3bert_model.tar.gz https://www.cl.uni-heidelberg.de/~opitz/data/
 COPY . .
 
 # Expose port
-EXPOSE 5000
+EXPOSE 10000
 
 # Command to run the application
 CMD ["python", "app.py"]
